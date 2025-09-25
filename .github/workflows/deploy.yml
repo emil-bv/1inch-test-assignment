@@ -1,0 +1,126 @@
+name: CI & Deploy to Cloud Run
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PROJECT_ID: test3-473120
+  REGION: europe-west1
+  SERVICE: nest-api
+  AR_REPO: nest-api
+  SA_EMAIL: gh-actions-deployer@test3-473120.iam.gserviceaccount.com
+  WORKLOAD_IDENTITY_PROVIDER: projects/789928711284/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint --workspace-root --if-present || npx eslint . --max-warnings=0
+
+      - name: Format check
+        run: npm run format:check --if-present
+
+      - name: Type check
+        run: npm run typecheck --if-present
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    env:
+      NODE_ENV: test
+      CHAIN_ID: ${{ vars.CHAIN_ID }}
+      UNISWAP_V2_FACTORY: ${{ vars.UNISWAP_V2_FACTORY }}
+      ETH_RPC_URL: ${{ secrets.ETH_RPC_URL }}
+      API_PREFIX: ${{ vars.API_PREFIX }}
+      API_VERSION: ${{ vars.API_VERSION }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test -- --ci --passWithNoTests
+
+      - name: E2E tests
+        run: |
+          if npm run | grep -q "test:e2e"; then
+            npm run test:e2e -- --runInBand --passWithNoTests
+          else
+            npx jest --config ./test/jest-e2e.json --runInBand --passWithNoTests
+          fi
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.SA_EMAIL }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build & Push image
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE }}"
+          TAG="${GITHUB_SHA}"
+          docker build -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${TAG}"
+          docker push "${IMAGE}:latest"
+
+      - name: Deploy to Cloud Run
+        run: |
+          IMAGE="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE }}:${GITHUB_SHA}"
+          gcloud run deploy "${{ env.SERVICE }}" \
+            --project="${{ env.PROJECT_ID }}" \
+            --region="${{ env.REGION }}" \
+            --image="${IMAGE}" \
+            --platform=managed \
+            --allow-unauthenticated \
+            --service-account="${{ env.SA_EMAIL }}" \
+            --set-env-vars="NODE_ENV=${{ vars.NODE_ENV }},API_PREFIX=${{ vars.API_PREFIX }},API_VERSION=${{ vars.API_VERSION }},CHAIN_ID=${{ vars.CHAIN_ID }},UNISWAP_V2_FACTORY=${{ vars.UNISWAP_V2_FACTORY }},ETH_RPC_URL=${{ secrets.ETH_RPC_URL }}" \
+            --quiet
